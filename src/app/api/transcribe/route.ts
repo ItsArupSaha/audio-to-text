@@ -1,4 +1,7 @@
 import { NextRequest, NextResponse } from "next/server";
+import { uploadToGCS } from "@/lib/gcs-helper";
+import { getSpeechClient } from "@/lib/google-speech";
+import { v4 as uuidv4 } from "uuid";
 
 export async function POST(req: NextRequest) {
     try {
@@ -11,73 +14,50 @@ export async function POST(req: NextRequest) {
             return NextResponse.json({ error: "No file provided" }, { status: 400 });
         }
 
-        if (!model) {
-            return NextResponse.json({ error: "No model selected" }, { status: 400 });
-        }
+        // 1. Upload to GCS
+        const buffer = Buffer.from(await file.arrayBuffer());
+        const filename = `audio-${uuidv4()}.mp3`;
+        const gcsUri = await uploadToGCS(buffer, filename);
+        console.log(`Uploaded to GCS: ${gcsUri}`);
 
-        const apiKey = process.env.GROQ_API_KEY;
-        if (!apiKey) {
-            return NextResponse.json({ error: "Server misconfigured: No API Key" }, { status: 500 });
-        }
+        // 2. Submit Batch Job
+        const projectId = process.env.GCP_PROJECT_ID;
+        const location = "us-central1";
+        // const recognizerId = "chirp-recognizer"; // We might need to create this dynamically or assume it exists/use default
 
-        // Convert Blob/File to File object for FormData if strictly required by Node fetch?
-        // In Next.js App Router, `req.formData()` gives us standard web File/Blob.
-        // We need to pass this to Groq. 
-        // Groq expects multipart/form-data. we can pipe it.
+        console.log(`[DEBUG] Transcribe Request: Project=${projectId}, Location=${location}, Model=chirp_2`);
 
-        const groqFormData = new FormData();
-        groqFormData.append("file", file);
-        groqFormData.append("model", model);
-        groqFormData.append("language", "bn"); // Bengali
-        groqFormData.append("response_format", "verbose_json"); // Get segments
+        // Construct request
+        // For V2 Dynamic Batch, we use BatchRecognize
+        const parent = `projects/${projectId}/locations/${location}`;
 
-        const response = await fetch("https://api.groq.com/openai/v1/audio/transcriptions", {
-            method: "POST",
-            headers: {
-                "Authorization": `Bearer ${apiKey}`,
-                // Do NOT set Content-Type header manually for FormData, fetch does it with boundary
+        const speechClient = getSpeechClient();
+        const [operation] = await speechClient.batchRecognize({
+            recognizer: `${parent}/recognizers/_`, // Use default settings or simple config
+            config: {
+                autoDecodingConfig: {},
+                languageCodes: ["bn-IN"],
+                model: "chirp_2", // 'chirp_2' confirmed to work for bn-IN in us-central1 via diagnostics
+                features: {
+                    enableWordTimeOffsets: true,
+                }
             },
-            body: groqFormData,
+            files: [{ uri: gcsUri }],
+            recognitionOutputConfig: {
+                inlineResponseConfig: {} // Keep result in response for simple polling, or GCS output
+            },
+            processingStrategy: "DYNAMIC_BATCHING"
         });
 
-        if (!response.ok) {
-            const errorText = await response.text();
-            console.error("Groq API Error:", response.status, errorText);
-
-            if (response.status === 429) {
-                return NextResponse.json(
-                    { error: "Rate limit exceeded", code: "RATE_LIMIT_EXCEEDED" },
-                    { status: 429 }
-                );
-            }
-
-            if (response.status === 413) {
-                return NextResponse.json(
-                    { error: "File too large", code: "PAYLOAD_TOO_LARGE" },
-                    { status: 413 }
-                );
-            }
-
-            return NextResponse.json(
-                { error: `Groq API Error: ${response.statusText}`, details: errorText },
-                { status: response.status }
-            );
-        }
-
-        const data = await response.json();
-
-        // Extract rate limit headers
-        const rateLimits: Record<string, string> = {};
-        response.headers.forEach((value, key) => {
-            if (key.startsWith('x-ratelimit')) {
-                rateLimits[key] = value;
-            }
+        // 3. Return Operation Name/ID for polling
+        return NextResponse.json({
+            status: "processing",
+            operationName: operation.name,
+            gcsUri
         });
 
-        return NextResponse.json({ ...data, rateLimits });
-
-    } catch (error) {
-        console.error("Handler Error:", error);
-        return NextResponse.json({ error: "Internal Server Error" }, { status: 500 });
+    } catch (error: any) {
+        console.error("Transcription Error:", error);
+        return NextResponse.json({ error: error.message }, { status: 500 });
     }
 }
