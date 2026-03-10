@@ -66,7 +66,7 @@ export async function processAudioFile(
         duration = 3600 * 3; // 3 hours limit fallback
     }
 
-    const SEGMENT_TIME = 600; // 10 mins (safer for quotas)
+    const SEGMENT_TIME = 300; // 5 mins (safest for Vercel 4.5MB payload limit)
     const chunks: AudioChunk[] = [];
     const OVERLAP = 2; // 2 seconds overlap
 
