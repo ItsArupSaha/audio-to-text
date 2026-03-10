@@ -3,10 +3,8 @@
 import React, { useState, useEffect, useRef } from 'react';
 import { sanitizeFilename, formatDuration, formatTimestamp } from '@/lib/file-utils';
 import { processAudioFile, AudioChunk } from '@/lib/audio-processing';
-import { quotaManager } from '@/lib/quota-manager'; // Client-side usage? define types
 import { generateDocx } from '@/lib/docx-generator';
 import { Upload, FileAudio, Play, Pause, Download, AlertTriangle, CheckCircle, Loader2, Clock, Eye, Copy, Check } from 'lucide-react';
-// import { saveAs } from 'file-saver'; // Removed unused dependency
 // actually I can use raw anchor tag for download
 
 // --- TYPES ---
@@ -29,7 +27,6 @@ interface AppState {
   chunkStatuses: ChunkStatus[];
   currentChunkIndex: number;
   status: ProcessingStatus;
-  quotaLogs: string[];
 }
 
 // --- COMPONENT ---
@@ -42,62 +39,27 @@ export default function Home() {
   const [progress, setProgress] = useState(0);
   const [progressMsg, setProgressMsg] = useState('');
   const [apiLog, setApiLog] = useState<string[]>([]);
-  const [quotaInfo, setQuotaInfo] = useState({
-    v3: { hourly: 7200, daily: 28800 },
-    turbo: { hourly: 7200, daily: 28800 }
-  });
+  const [isTranscribingAll, setIsTranscribingAll] = useState(false);
+  const abortControllerRef = useRef<AbortController | null>(null);
 
-  // Manual Flow State
-  const [contextDescription, setContextDescription] = useState("A spiritual discourse in Bengali with Sanskrit slokas.");
-  const [glossary, setGlossary] = useState("Krishna, Bhagavatam, Prabhavishnu");
-  const [styleGuide, setStyleGuide] = useState("ওঁ নমো ভগবতে বাসুদেবায় । যদা যদা হি ধর্মস্য গ্লানির্ভবতি ভারত ।"); // Sanskrit in Bengali script
-  const [isSaving, setIsSaving] = useState(false);
-
-  // Helper to construct prompt
-  const constructPrompt = (prevTranscript: string = "") => {
-    // Limit to ~224 tokens. 
-    // Priority: Style Guide (Crucial for script) > Context > Glossary > Prev Text
-    // Style guide ~ 15-20 tokens. Context ~ 10-15. Glossary ~ 10. 
-    // We have plenty of room for prev text.
-
-    const base = `${contextDescription} Write Sanskrit in Bengali script like: ${styleGuide} Key terms: ${glossary}.`;
-    const remainingChars = 900 - base.length; // Approximate char limit for 224 tokens
-
-    let context = "";
-    if (prevTranscript && remainingChars > 50) {
-      // Take last N chars
-      context = ` Previous text: ${prevTranscript.slice(-remainingChars)}`;
+  const resetState = () => {
+    if (abortControllerRef.current) {
+      abortControllerRef.current.abort();
     }
-
-    return base + context;
+    setFile(null);
+    setStatus('idle');
+    setChunks([]);
+    setChunkStatuses([]);
+    setApiLog([]);
+    setIsTranscribingAll(false);
+    setProgress(0);
+    setProgressMsg("");
   };
 
-  const handleSaveChunks = async () => {
-    setIsSaving(true);
-    setProgressMsg("Saving chunks to local server...");
+  const transcribeSingleChunk = async (index: number): Promise<void> => {
+    // Prevent overlapping transcriptions
+    if (chunkStatuses[index]?.status === 'processing') return;
 
-    try {
-      for (let i = 0; i < chunks.length; i++) {
-        const chunk = chunks[i];
-        const formData = new FormData();
-        formData.append("file", chunk.blob);
-        formData.append("filename", file?.name || "audio");
-        formData.append("chunkIndex", i.toString());
-
-        const res = await fetch("/api/save-chunk", { method: "POST", body: formData });
-        if (!res.ok) throw new Error(`Failed to save chunk ${i}`);
-      }
-      setApiLog(prev => [...prev, "All chunks saved locally."]);
-      setStatus("ready_to_transcribe"); // Move to manual phase
-    } catch (e: any) {
-      console.error(e);
-      setApiLog(prev => [...prev, `Save Error: ${e.message}`]);
-    } finally {
-      setIsSaving(false);
-    }
-  };
-
-  const transcribeSingleChunk = async (index: number) => {
     const chunk = chunks[index];
     // Get previous transcript for context if available
     const prevChunk = chunkStatuses[index - 1];
@@ -114,11 +76,7 @@ export default function Home() {
       });
     };
 
-    const prompt = constructPrompt(prevText);
     const duration = chunk.duration;
-
-    // Check quota locally first (kept for legacy/consistency, even if using GCP)
-    let model = quotaManager.getPreferredModel(duration);
 
     updateStatus('processing', { modelUsed: 'google-chirp-batch' });
     setProgressMsg(`Uploading Chunk ${index + 1}...`);
@@ -126,13 +84,22 @@ export default function Home() {
     try {
       const formData = new FormData();
       formData.append('file', chunk.blob, `chunk_${index}.mp3`);
-      formData.append('model', model || 'whisper-large-v3'); // Fallback
-      formData.append('prompt', prompt);
+      // Model and prompt are handled backend side for Google Cloud API
+      // We keep sending minimal structure
       formData.append('language', 'bn');
 
       setApiLog(prev => [...prev, `[Chunk ${index + 1}] Uploading to Google Cloud...`]);
 
-      const res = await fetch('/api/transcribe', { method: 'POST', body: formData });
+      // Provide abort signal to fetch
+      if (!abortControllerRef.current || abortControllerRef.current.signal.aborted) {
+        abortControllerRef.current = new AbortController();
+      }
+
+      const res = await fetch('/api/transcribe', { 
+        method: 'POST', 
+        body: formData,
+        signal: abortControllerRef.current.signal 
+      });
 
       const data = await res.json();
 
@@ -144,10 +111,19 @@ export default function Home() {
       const { operationName } = data;
       setProgressMsg("Processing with Google Cloud (Dynamic Batch)... This saves 75% cost but may take a moment.");
 
+      return new Promise<void>((resolve, reject) => {
       // Poll for status
       const pollInterval = setInterval(async () => {
         try {
-          const statusRes = await fetch(`/api/status?operationName=${operationName}`);
+          if (abortControllerRef.current?.signal.aborted) {
+            clearInterval(pollInterval);
+            reject(new Error("Transcription aborted by user."));
+            return;
+          }
+
+          const statusRes = await fetch(`/api/status?operationName=${operationName}`, {
+            signal: abortControllerRef.current?.signal // Also listen to aborts
+          });
           const statusData = await statusRes.json();
 
           if (statusData.status === 'completed') {
@@ -179,52 +155,66 @@ export default function Home() {
               modelUsed: 'google-chirp-batch'
             });
             setProgressMsg("");
+            resolve();
           } else if (statusData.status === 'error') {
             clearInterval(pollInterval);
-            throw new Error(statusData.error);
+            reject(new Error(statusData.error));
           } else {
             // still processing
             setProgressMsg(`Processing with Google Cloud... ${Math.round(statusData.progress || 0)}%`);
           }
         } catch (e) {
           console.error("Polling error", e);
+          if (e instanceof Error && e.name === 'AbortError') {
+             clearInterval(pollInterval);
+             reject(e);
+          }
         }
       }, 5000); // Poll every 5s
-
+      }); // End Promise
     } catch (error: any) {
+      if (error.name === 'AbortError' || error.message.includes('aborted')) {
+        updateStatus('skipped', { errorMsg: 'Aborted' });
+        setProgressMsg('Process aborted.');
+        throw error;
+      }
       console.error(error);
       updateStatus('error', { errorMsg: error.message });
+      setProgressMsg("");
+      throw error;
+    }
+  };
+
+  const transcribeAllChunks = async () => {
+    setIsTranscribingAll(true);
+    setApiLog(prev => [...prev, "Starting Transcribe All..."]);
+
+    try {
+      for (let i = 0; i < chunks.length; i++) {
+        // Only transcribe if not already completed successfully
+        if (chunkStatuses[i]?.status !== 'completed') {
+          setApiLog(prev => [...prev, `Transcribing Chunk ${i + 1} of ${chunks.length}...`]);
+          await transcribeSingleChunk(i);
+        }
+      }
+
+      setApiLog(prev => [...prev, "All chunks transcribed successfully."]);
+      // Attempt to auto-download DOCX
+      downloadDocx();
+    } catch (e: any) {
+      console.error("Transcribe All Interrupted:", e);
+      setApiLog(prev => [...prev, `Transcribe All stopped due to error: ${e.message}`]);
+    } finally {
+      setIsTranscribingAll(false);
       setProgressMsg("");
     }
   };
 
-
-  const updateQuotaDisplay = () => {
-    // quotaManager is client-side singleton
-    const v3 = quotaManager.getRemaining('whisper-large-v3');
-    const turbo = quotaManager.getRemaining('whisper-large-v3-turbo');
-    setQuotaInfo({
-      v3: { hourly: v3.hourly, daily: v3.daily },
-      turbo: { hourly: turbo.hourly, daily: turbo.daily }
-    });
-  };
-
-  useEffect(() => {
-    // Initial quota check
-    updateQuotaDisplay();
-    const interval = setInterval(updateQuotaDisplay, 30000); // Poll every 30s
-    return () => clearInterval(interval);
-  }, []);
-
   const handleFileSelect = (e: React.ChangeEvent<HTMLInputElement>) => {
     if (e.target.files && e.target.files[0]) {
+      resetState(); // Reset everything and abort any ongoing tasks
       const selected = e.target.files[0];
       setFile(selected);
-      setStatus('idle');
-      setChunks([]);
-      setChunkStatuses([]);
-      setApiLog([]);
-      // Reset statuses
     }
   };
 
@@ -338,64 +328,16 @@ export default function Home() {
     <main className="min-h-screen bg-neutral-900 text-neutral-100 p-8 font-sans">
       <div className="max-w-5xl mx-auto space-y-8">
         <header className="flex justify-between items-center border-b border-neutral-800 pb-6">
-          <h1 className="text-2xl font-bold tracking-tight text-emerald-400">Bengali Audio Transcriber <span className="text-neutral-500 text-sm font-normal ml-2">v2.0 Manual Control</span></h1>
-          <div className="text-xs text-neutral-500 font-mono flex gap-4">
-            <div className="flex flex-col items-end gap-1">
-              <div className="text-right">
-                <span className="text-neutral-400 font-bold block text-xs">Whisper Large V3</span>
-                <span className={`text-xs font-mono ${quotaInfo.v3.hourly < 600 ? 'text-red-400' : 'text-emerald-400'}`}>
-                  {formatDuration(quotaInfo.v3.hourly)} left / 2h
-                </span>
-              </div>
-              <div className="text-right">
-                <span className="text-neutral-400 font-bold block text-xs">Turbo</span>
-                <span className={`text-xs font-mono ${quotaInfo.turbo.hourly < 600 ? 'text-red-400' : 'text-emerald-400'}`}>
-                  {formatDuration(quotaInfo.turbo.hourly)} left / 2h
-                </span>
-              </div>
-            </div>
-          </div>
+          <h1 className="text-2xl font-bold tracking-tight text-emerald-400">Bengali Audio Transcriber</h1>
+          {file && (
+            <button
+              onClick={resetState}
+              className="text-sm text-neutral-400 hover:text-white border border-neutral-700 hover:border-neutral-500 bg-neutral-800 px-4 py-2 rounded-lg transition"
+            >
+              Upload New File
+            </button>
+          )}
         </header>
-
-        {/* Prompt Settings */}
-        <section className="bg-neutral-800/30 p-6 rounded-xl border border-neutral-700 space-y-4">
-          <h2 className="text-sm font-bold text-neutral-400 uppercase tracking-wider">Transcription Context</h2>
-          <div className="grid gap-4 md:grid-cols-2">
-            <div>
-              <label className="block text-xs text-neutral-500 mb-1">Context Description (Nature of Talk)</label>
-              <textarea
-                className="w-full bg-neutral-900 border border-neutral-700 rounded-lg p-3 text-sm focus:border-emerald-500 focus:outline-none"
-                rows={2}
-                value={contextDescription}
-                onChange={(e) => setContextDescription(e.target.value)}
-                placeholder="E.g., A spiritual discourse in Bengali about material suffering..."
-              />
-            </div>
-            <div>
-              <label className="block text-xs text-neutral-500 mb-1">Glossary (Comma separated names/terms)</label>
-              <textarea
-                className="w-full bg-neutral-900 border border-neutral-700 rounded-lg p-3 text-sm focus:border-emerald-500 focus:outline-none"
-                rows={2}
-                value={glossary}
-                onChange={(e) => setGlossary(e.target.value)}
-                placeholder="Krishna, Bhagavatam, Chaitanya..."
-              />
-            </div>
-            <div className="md:col-span-2">
-              <label className="block text-xs text-neutral-500 mb-1">Style Guide (Sanskrit Slokas in Bengali Script)</label>
-              <textarea
-                className="w-full bg-neutral-900 border border-neutral-700 rounded-lg p-3 text-sm focus:border-emerald-500 focus:outline-none font-bengali"
-                rows={2}
-                value={styleGuide}
-                onChange={(e) => setStyleGuide(e.target.value)}
-                placeholder="Put a sample sloka here explicitly in Bengali script to guide the model."
-              />
-              <p className="text-[10px] text-neutral-500 mt-1">
-                *Crucial*: This teaches the model to write Sanskrit sounds using Bengali letters (e.g. "নমো" instead of "namo").
-              </p>
-            </div>
-          </div>
-        </section>
 
         {/* Upload Section */}
         <section className="space-y-4">
@@ -448,6 +390,16 @@ export default function Home() {
                 {chunks.length} Chunks Ready
               </h2>
               <div className="flex gap-2">
+                {chunkStatuses.some(s => s.status !== 'completed') && (
+                  <button
+                    onClick={transcribeAllChunks}
+                    disabled={isTranscribingAll || chunkStatuses.some(s => s.status === 'processing')}
+                    className="bg-blue-600 text-white hover:bg-blue-500 px-4 py-2 rounded-lg text-sm font-medium flex items-center gap-2"
+                  >
+                    {isTranscribingAll ? <Loader2 className="animate-spin w-4 h-4" /> : <Play className="w-4 h-4" />}
+                    {isTranscribingAll ? 'Transcribing All...' : 'Transcribe All'}
+                  </button>
+                )}
                 {hasCompletedChunks && (
                   <>
                     <button
@@ -470,16 +422,6 @@ export default function Home() {
                       <Download className="w-4 h-4" /> Export DOCX
                     </button>
                   </>
-                )}
-                {status !== 'ready_to_transcribe' && !hasCompletedChunks && (
-                  <button
-                    onClick={handleSaveChunks}
-                    disabled={isSaving}
-                    className="bg-blue-600 text-white hover:bg-blue-500 px-6 py-2 rounded-lg text-sm font-medium flex items-center gap-2"
-                  >
-                    {isSaving ? <Loader2 className="animate-spin w-4 h-4" /> : <Download className="w-4 h-4" />}
-                    Save Chunks Locally First
-                  </button>
                 )}
               </div>
             </div>
@@ -520,19 +462,18 @@ export default function Home() {
                         <Loader2 className="animate-spin w-3 h-3" /> Processing...
                       </button>
                     ) : s.status === 'completed' ? (
-                      <button onClick={() => transcribeSingleChunk(idx)} className="px-3 py-1 bg-neutral-800 text-neutral-400 hover:text-white rounded border border-neutral-700 text-xs transition">
+                      <button onClick={() => transcribeSingleChunk(idx)} disabled={isTranscribingAll} className="px-3 py-1 bg-neutral-800 text-neutral-400 hover:text-white rounded border border-neutral-700 text-xs transition disabled:opacity-50">
                         Redo
                       </button>
                     ) : (
                       <button
                         onClick={() => transcribeSingleChunk(idx)}
-                        // Disable if previous not done? Optional.
-                        // disabled={idx > 0 && chunkStatuses[idx-1].status !== 'completed'} 
+                        disabled={isTranscribingAll}
                         className={`px-4 py-2 rounded-lg text-sm font-medium flex items-center gap-2 shadow-lg transition
                                         ${idx > 0 && chunkStatuses[idx - 1].status !== 'completed'
                             ? 'bg-neutral-700 text-neutral-400 hover:bg-neutral-600'
                             : 'bg-emerald-600 text-white hover:bg-emerald-500 shadow-emerald-900/20'
-                          }
+                          } disabled:opacity-50
                                     `}
                       >
                         <Play className="w-3 h-3" /> Transcribe
